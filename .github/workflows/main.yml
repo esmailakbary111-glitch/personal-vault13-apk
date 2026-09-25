@@ -1,0 +1,153 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_PLATFORM: "platforms;android-35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  GRADLE_VERSION: "8.10.2"
+  WEB_ASSETS: apps/android/app/src/main/assets/web
+  APK_PATH: apps/android/app/build/outputs/apk/debug/app-debug.apk
+
+jobs:
+  apk:
+    name: Web build + Android assembleDebug
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build-tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platform-tools" "$ANDROID_PLATFORM" "build-tools;$ANDROID_BUILD_TOOLS"
+
+      - name: Install npm dependencies
+        run: |
+          node --version
+          npm --version
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "No package-lock.json in repo, using npm install"
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Offline crypto and search tests
+        run: npm run test:node
+
+      - name: Forbid localhost / loopback in sources
+        run: npm run verify:no-localhost
+
+      - name: Web build (Vite)
+        run: npm run build:web
+
+      - name: Copy web build into APK assets (with path checks)
+        run: npm run android:sync
+
+      - name: Verify web assets
+        run: |
+          set -euo pipefail
+          test -s "$WEB_ASSETS/index.html"
+          if grep -Eq '(src|href)="/' "$WEB_ASSETS/index.html"; then
+            echo "::error::index.html uses absolute asset paths; Vite base must be './'"
+            exit 1
+          fi
+          if grep -RIEq 'localhost|127\.0\.0\.1' "$WEB_ASSETS"; then
+            echo "::error::bundled assets reference localhost"
+            exit 1
+          fi
+          grep -q 'Content-Security-Policy' "$WEB_ASSETS/index.html"
+          echo "Bundled files:"
+          find "$WEB_ASSETS" -type f -printf '  %P (%s bytes)\n'
+
+      - name: Prepare stable signing key (optional)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/pv-signing.jks"
+            echo "PV_KEYSTORE_PATH=$RUNNER_TEMP/pv-signing.jks" >> "$GITHUB_ENV"
+            echo "Signing with the stable key from repository secrets."
+          else
+            echo "::notice::ANDROID_KEYSTORE_BASE64 not set. The APK is signed with an auto-generated debug key; each CI run gets a different key, so uninstall before installing a newer build (export a backup first)."
+          fi
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Android build (assembleDebug)
+        env:
+          PV_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PV_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PV_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle -p apps/android --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK (assets, signature, manifest)
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS"
+          test -s "$APK_PATH"
+          ls -l "$APK_PATH"
+
+          echo "== assets inside APK =="
+          unzip -l "$APK_PATH" | grep 'assets/web/' | tee apk-assets.txt
+          grep -q 'assets/web/index.html' apk-assets.txt
+          for ref in $(grep -oE '(src|href)="\./[^"]+"' "$WEB_ASSETS/index.html" | sed -E 's/.*"\.\/([^"]+)"/\1/'); do
+            grep -q "assets/web/$ref" apk-assets.txt || { echo "::error::missing in APK: assets/web/$ref"; exit 1; }
+            echo "  ok assets/web/$ref"
+          done
+
+          echo "== signature =="
+          "$BT/apksigner" verify --verbose --print-certs "$APK_PATH"
+
+          echo "== manifest =="
+          "$BT/aapt2" dump badging "$APK_PATH" | tee badging.txt
+          grep -q "package: name='com.personalvault.app'" badging.txt
+          grep -q "launchable-activity: name='com.personalvault.app.MainActivity'" badging.txt
+          grep -q "sdkVersion:'26'" badging.txt
+          if grep -q "uses-permission: name='android.permission.INTERNET'" badging.txt; then
+            echo "::error::APK must not request INTERNET"
+            exit 1
+          fi
+
+          sha256sum "$APK_PATH" | tee app-debug.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: personal-vault-app-debug
+          path: |
+            ${{ env.APK_PATH }}
+            app-debug.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
